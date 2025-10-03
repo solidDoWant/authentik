@@ -60,7 +60,7 @@ from authentik.providers.oauth2.models import (
     ResponseTypes,
     ScopeMapping,
 )
-from authentik.providers.oauth2.utils import HttpResponseRedirectScheme
+from authentik.providers.oauth2.utils import HttpResponseRedirectScheme, TokenResponse, cors_allow
 from authentik.providers.oauth2.views.userinfo import UserInfoView
 from authentik.stages.consent.models import ConsentMode, ConsentStage
 from authentik.stages.consent.stage import (
@@ -132,11 +132,13 @@ class OAuthAuthorizationParams:
             scope=set(query_dict.get("scope", "").split()),
             state=state,
             nonce=query_dict.get("nonce"),
-            prompt=ALLOWED_PROMPT_PARAMS.intersection(set(query_dict.get("prompt", "").split())),
+            prompt=ALLOWED_PROMPT_PARAMS.intersection(
+                set(query_dict.get("prompt", "").split())),
             request=query_dict.get("request", None),
             max_age=int(max_age) if max_age else None,
             code_challenge=query_dict.get("code_challenge"),
-            code_challenge_method=query_dict.get("code_challenge_method", "plain"),
+            code_challenge_method=query_dict.get(
+                "code_challenge_method", "plain"),
             github_compat=github_compat,
         )
 
@@ -145,7 +147,8 @@ class OAuthAuthorizationParams:
             client_id=self.client_id
         ).first()
         if not self.provider:
-            LOGGER.warning("Invalid client identifier", client_id=self.client_id)
+            LOGGER.warning("Invalid client identifier",
+                           client_id=self.client_id)
             raise ClientIdError(client_id=self.client_id)
         self.check_redirect_uri()
         self.check_grant()
@@ -177,7 +180,8 @@ class OAuthAuthorizationParams:
         # Grant type validation.
         if not self.grant_type:
             LOGGER.warning("Invalid response type", type=self.response_type)
-            raise AuthorizeError(self.redirect_uri, "unsupported_response_type", "", self.state)
+            raise AuthorizeError(
+                self.redirect_uri, "unsupported_response_type", "", self.state)
 
         if self.response_mode not in ResponseMode.values:
             self.response_mode = ResponseMode.QUERY
@@ -190,10 +194,12 @@ class OAuthAuthorizationParams:
         allowed_redirect_urls = self.provider.redirect_uris
         if not self.redirect_uri:
             LOGGER.warning("Missing redirect uri.")
-            raise RedirectUriError("", allowed_redirect_urls).with_cause("redirect_uri_missing")
+            raise RedirectUriError("", allowed_redirect_urls).with_cause(
+                "redirect_uri_missing")
 
         if len(allowed_redirect_urls) < 1:
-            LOGGER.info("Setting redirect for blank redirect_uris", redirect=self.redirect_uri)
+            LOGGER.info("Setting redirect for blank redirect_uris",
+                        redirect=self.redirect_uri)
             self.provider.redirect_uris = [
                 RedirectURI(RedirectURIMatchingMode.STRICT, self.redirect_uri)
             ]
@@ -321,7 +327,8 @@ class OAuthAuthorizationParams:
             provider=self.provider,
             auth_time=auth_event.created if auth_event else now,
             code=uuid4().hex,
-            expires=now + timedelta_from_string(self.provider.access_code_validity),
+            expires=now +
+            timedelta_from_string(self.provider.access_code_validity),
             scope=self.scope,
             nonce=self.nonce,
             session=request.session["authenticatedsession"],
@@ -345,6 +352,10 @@ class AuthorizationFlowInitView(BufferedPolicyAccessView):
     def pre_permission_check(self):
         """Check prompt parameter before checking permission/authentication,
         see https://openid.net/specs/openid-connect-core-1_0.html#rfc.section.3.1.2.6"""
+        # Allow unauthenticated CORS preflight requests
+        if self.request.method == "OPTIONS":
+            return
+
         # Quick sanity check at the beginning to prevent event spamming
         if len(self.request.GET) < 1:
             raise Http404
@@ -353,12 +364,15 @@ class AuthorizationFlowInitView(BufferedPolicyAccessView):
                 self.request, github_compat=self.github_compat
             )
         except AuthorizeError as error:
-            LOGGER.warning(error.description, redirect_uri=error.redirect_uri, cause=error.cause)
-            raise RequestValidationError(error.get_response(self.request)) from None
+            LOGGER.warning(error.description,
+                           redirect_uri=error.redirect_uri, cause=error.cause)
+            raise RequestValidationError(
+                error.get_response(self.request)) from None
         except OAuth2Error as error:
             LOGGER.warning(error.description, cause=error.cause)
             raise RequestValidationError(
-                bad_request_message(self.request, error.description, title=error.error)
+                bad_request_message(
+                    self.request, error.description, title=error.error)
             ) from None
         except OAuth2Provider.DoesNotExist:
             raise Http404 from None
@@ -387,8 +401,35 @@ class AuthorizationFlowInitView(BufferedPolicyAccessView):
         request.context["oauth_response_type"] = self.params.response_type
         return request
 
+    def dispatch_with_language(self, request: HttpRequest, *args, **kwargs) -> HttpResponse:
+        """Activate language from OIDC specific ui_locales parameter, picking the earliest one
+        available"""
+
+        response = super().dispatch(request, *args, **kwargs)
+
+        # Add CORS headers based on the provider's redirect URIs
+        allowed_origins = []
+        if self.provider and hasattr(self.provider, "redirect_uris"):
+            allowed_origins = [x.url for x in self.provider.redirect_uris]
+        cors_allow(self.request, response, *allowed_origins)
+
+        # Override Access-Control-Allow-Methods to only allow GET and OPTIONS
+        # POST is not defined for this endpoint
+        if "Access-Control-Allow-Methods" in response:
+            response["Access-Control-Allow-Methods"] = "GET, OPTIONS"
+
+        return response
+
+    def dispatch(self, request: HttpRequest, *args, **kwargs):
+        # Activate language before parsing params (error messages should be localised)
+        return self.dispatch_with_language(request, *args, **kwargs)
+
+    def options(self, request: HttpRequest, *args, **kwargs) -> HttpResponse:
+        # Return an empty response. The dispatch method will add the CORS headers.
+        return TokenResponse({})
+
     def get(self, request: HttpRequest, *args, **kwargs) -> HttpResponse:
-        """Start FlowPLanner, return to flow executor shell"""
+        """Start FlowPlanner, return to flow executor shell"""
         # Require a login event to be set, otherwise make the user re-login
         login_event = get_login_event(request)
         if not login_event:
@@ -438,7 +479,8 @@ class AuthorizationFlowInitView(BufferedPolicyAccessView):
                     # OAuth2 related params
                     PLAN_CONTEXT_PARAMS: self.params,
                     # Consent related params
-                    PLAN_CONTEXT_CONSENT_HEADER: _("You're about to sign into %(application)s.")
+                    PLAN_CONTEXT_CONSENT_HEADER: _(
+                        "You're about to sign into %(application)s.")
                     % {"application": self.application.name},
                     PLAN_CONTEXT_CONSENT_PERMISSIONS: scope_descriptions,
                 },
@@ -497,7 +539,8 @@ class OAuthFulfillmentStage(StageView):
                     "component": "ak-stage-autosubmit",
                     "title": self.executor.plan.context.get(
                         PLAN_CONTEXT_TITLE,
-                        _("Redirecting to {app}...".format_map({"app": self.application.name})),
+                        _("Redirecting to {app}...".format_map(
+                            {"app": self.application.name})),
                     ),
                     "url": self.params.redirect_uri,
                     "attrs": query_params,
@@ -521,9 +564,12 @@ class OAuthFulfillmentStage(StageView):
         if PLAN_CONTEXT_PARAMS not in self.executor.plan.context:
             LOGGER.warning("Got to fulfillment stage with no pending context")
             return HttpResponseBadRequest()
-        self.params: OAuthAuthorizationParams = self.executor.plan.context.pop(PLAN_CONTEXT_PARAMS)
-        self.application: Application = self.executor.plan.context.pop(PLAN_CONTEXT_APPLICATION)
-        self.provider = get_object_or_404(OAuth2Provider, pk=self.application.provider_id)
+        self.params: OAuthAuthorizationParams = self.executor.plan.context.pop(
+            PLAN_CONTEXT_PARAMS)
+        self.application: Application = self.executor.plan.context.pop(
+            PLAN_CONTEXT_APPLICATION)
+        self.provider = get_object_or_404(
+            OAuth2Provider, pk=self.application.provider_id)
         try:
             # At this point we don't need to check permissions anymore
             if {PROMPT_NONE, PROMPT_CONSENT}.issubset(self.params.prompt):
@@ -567,7 +613,8 @@ class OAuthFulfillmentStage(StageView):
             if self.params.response_mode == ResponseMode.QUERY:
                 query_params = parse_qs(uri.query)
                 query_params["code"] = code.code
-                query_params["state"] = [str(self.params.state) if self.params.state else ""]
+                query_params["state"] = [
+                    str(self.params.state) if self.params.state else ""]
 
                 uri = uri._replace(query=urlencode(query_params, doseq=True))
                 return urlunsplit(uri)
@@ -576,12 +623,14 @@ class OAuthFulfillmentStage(StageView):
                 query_fragment = {}
                 if self.params.grant_type in [GrantTypes.AUTHORIZATION_CODE]:
                     query_fragment["code"] = code.code
-                    query_fragment["state"] = [str(self.params.state) if self.params.state else ""]
+                    query_fragment["state"] = [
+                        str(self.params.state) if self.params.state else ""]
                 else:
                     query_fragment = self.create_implicit_response(code)
 
                 uri = uri._replace(
-                    fragment=uri.fragment + urlencode(query_fragment, doseq=True),
+                    fragment=uri.fragment +
+                    urlencode(query_fragment, doseq=True),
                 )
 
                 return urlunsplit(uri)
@@ -590,7 +639,8 @@ class OAuthFulfillmentStage(StageView):
                 post_params = {}
                 if self.params.grant_type in [GrantTypes.AUTHORIZATION_CODE]:
                     post_params["code"] = code.code
-                    post_params["state"] = [str(self.params.state) if self.params.state else ""]
+                    post_params["state"] = [
+                        str(self.params.state) if self.params.state else ""]
                 else:
                     post_params = self.create_implicit_response(code)
 
@@ -600,7 +650,8 @@ class OAuthFulfillmentStage(StageView):
 
             raise OAuth2Error()
         except OAuth2Error as error:
-            LOGGER.warning("Error when trying to create response uri", error=error)
+            LOGGER.warning(
+                "Error when trying to create response uri", error=error)
             raise AuthorizeError(
                 self.params.redirect_uri,
                 "server_error",
@@ -614,7 +665,8 @@ class OAuthFulfillmentStage(StageView):
         auth_event = get_login_event(self.request)
 
         now = timezone.now()
-        access_token_expiry = now + timedelta_from_string(self.provider.access_token_validity)
+        access_token_expiry = now + \
+            timedelta_from_string(self.provider.access_token_validity)
         token = AccessToken(
             user=self.request.user,
             scope=self.params.scope,
@@ -651,7 +703,8 @@ class OAuthFulfillmentStage(StageView):
             ResponseTypes.CODE_ID_TOKEN,
             ResponseTypes.CODE_ID_TOKEN_TOKEN,
         ]:
-            query_fragment["id_token"] = self.provider.encode(id_token.to_dict())
+            query_fragment["id_token"] = self.provider.encode(
+                id_token.to_dict())
             token._id_token = dumps(id_token.to_dict())
 
         token.save()
@@ -662,7 +715,8 @@ class OAuthFulfillmentStage(StageView):
 
         query_fragment["token_type"] = TOKEN_TYPE
         query_fragment["expires_in"] = int(
-            timedelta_from_string(self.provider.access_token_validity).total_seconds()
+            timedelta_from_string(
+                self.provider.access_token_validity).total_seconds()
         )
         query_fragment["state"] = self.params.state if self.params.state else ""
         return query_fragment
